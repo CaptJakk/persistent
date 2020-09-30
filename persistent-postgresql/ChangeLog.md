@@ -1,5 +1,40 @@
 # Changelog for persistent-postgresql
 
+## (Unreleased) 2.11.0.0
+
+* Implement interval support. [#1053](https://github.com/yesodweb/persistent/pull/1053)
+* [#1060](https://github.com/yesodweb/persistent/pull/1060)
+  * The QuasiQuoter now supports `OnDelete` and `OnUpdate` cascade options.
+* Handle foreign key constraint names over 63 characters. See [#996](https://github.com/yesodweb/persistent/pull/996) for details.
+* Fix a bug in `upsertSql` query which had not been discovered previously because the query wasn't actually used. [#856](https://github.com/yesodweb/persistent/pull/856)
+* [#1072](https://github.com/yesodweb/persistent/pull/1072) Refactored `test/JSONTest.hs` to use `hspec`
+  * added `runConn_` to run a db connection and return result
+  * Renamed `db` to `runConnAssert` in `test/PgInit.hs` for clarity
+  * Ran `test/ArrayAggTest.hs` (which was previously written but not being run)
+* Remove unnecessary deriving of Typeable [#1114](https://github.com/yesodweb/persistent/pull/1114)
+
+## 2.10.1.2
+
+* Fix issue with multiple foreign keys on single column. [#1010](https://github.com/yesodweb/persistent/pull/1010)
+
+## 2.10.1.1
+
+* Compatibility with latest persistent-template for test suite [#1002](https://github.com/yesodweb/persistent/pull/1002/files)
+
+## 2.10.1
+
+* Added support for the `constraint=` attribute to the Postgresql backend. [#979](https://github.com/yesodweb/persistent/pull/979)
+
+## 2.10.0
+
+* Added question mark operators (`(?.), (?|.), (?&.)`) to `Database.Persist.Postgresql.JSON` [#863](https://github.com/yesodweb/persistent/pull/863)
+* Changes to certain types:
+    * `PersistValue`: added `PersistArray` data constructor
+    * `Filter`: Changed the `filterValue :: Either a [a]` to `filterValue :: FilterValue`
+
+## 2.9.1
+* Add `openSimpleConnWithVersion` function. [#883](https://github.com/yesodweb/persistent/pull/883)
+
 ## 2.9.0
 
 * Added support for SQL isolation levels to via SqlBackend. [#812]
@@ -7,7 +42,7 @@
 
 ## 2.8.2
 
-Added module `Database.Persist.Postgres.JSON` [#793](https://github.com/yesodweb/persistent/pull/793)
+Added module `Database.Persist.Postgresql.JSON` [#793](https://github.com/yesodweb/persistent/pull/793)
 
 * `PersistField` and `PersistFieldSql` instances for `Data.Aeson.Value`
 * Filter operators `(@>.)` and `(<@.)` to filter on JSON values

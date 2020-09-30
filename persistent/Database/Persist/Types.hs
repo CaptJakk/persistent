@@ -1,5 +1,3 @@
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE TypeFamilies #-}
 module Database.Persist.Types
     ( module Database.Persist.Types.Base
     , SomePersistField (..)
@@ -7,9 +5,11 @@ module Database.Persist.Types
     , BackendSpecificUpdate
     , SelectOpt (..)
     , Filter (..)
+    , FilterValue (..)
     , BackendSpecificFilter
     , Key
     , Entity (..)
+    , OverflowNatural(..)
     ) where
 
 import Database.Persist.Types.Base

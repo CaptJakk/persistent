@@ -1,16 +1,10 @@
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module Database.Persist.Sql.Types.Internal
     ( HasPersistBackend (..)
     , IsPersistBackend (..)
-    , SqlReadBackend (unSqlReadBackend)
-    , SqlWriteBackend (unSqlWriteBackend)
+    , SqlReadBackend (..)
+    , SqlWriteBackend (..)
     , readToUnknown
     , readToWrite
     , writeToUnknown
@@ -27,8 +21,9 @@ module Database.Persist.Sql.Types.Internal
     , IsSqlBackend
     ) where
 
+import Data.List.NonEmpty (NonEmpty(..))
 import Control.Monad.IO.Class (MonadIO (..))
-import Control.Monad.Logger (LogSource, LogLevel)
+import Control.Monad.Logger (LogSource, LogLevel, Loc)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (ReaderT, runReaderT, ask)
 import Data.Acquire (Acquire)
@@ -39,7 +34,8 @@ import Data.Map (Map)
 import Data.Monoid ((<>))
 import Data.String (IsString)
 import Data.Text (Text)
-import Data.Typeable (Typeable)
+import System.Log.FastLogger (LogStr)
+
 import Database.Persist.Class
   ( HasPersistBackend (..)
   , PersistQueryRead, PersistQueryWrite
@@ -49,8 +45,6 @@ import Database.Persist.Class
   )
 import Database.Persist.Class.PersistStore (IsPersistBackend (..))
 import Database.Persist.Types
-import Language.Haskell.TH.Syntax (Loc)
-import System.Log.FastLogger (LogStr)
 
 type LogFunc = Loc -> LogSource -> LogLevel -> LogStr -> IO ()
 
@@ -82,15 +76,32 @@ makeIsolationLevelStatement l = "SET TRANSACTION ISOLATION LEVEL " <> case l of
     RepeatableRead -> "REPEATABLE READ"
     Serializable -> "SERIALIZABLE"
 
+-- | A 'SqlBackend' represents a handle or connection to a database. It
+-- contains functions and values that allow databases to have more
+-- optimized implementations, as well as references that benefit
+-- performance and sharing.
+--
+-- A 'SqlBackend' is *not* thread-safe. You should not assume that
+-- a 'SqlBackend' can be shared among threads and run concurrent queries.
+-- This *will* result in problems. Instead, you should create a @'Pool'
+-- 'SqlBackend'@, known as a 'ConnectionPool', and pass that around in
+-- multi-threaded applications.
+--
+-- To run actions in the @persistent@ library, you should use the
+-- 'runSqlConn' function. If you're using a multithreaded application, use
+-- the 'runSqlPool' function.
 data SqlBackend = SqlBackend
     { connPrepare :: Text -> IO Statement
-    -- | table name, column names, id name, either 1 or 2 statements to run
+    -- ^ This function should prepare a 'Statement' in the target database,
+    -- which should allow for efficient query reuse.
     , connInsertSql :: EntityDef -> [PersistValue] -> InsertSqlResult
+    -- ^ This function generates the SQL and values necessary for
+    -- performing an insert against the database.
     , connInsertManySql :: Maybe (EntityDef -> [[PersistValue]] -> InsertSqlResult)
     -- ^ SQL for inserting many rows and returning their primary keys, for
-    -- backends that support this functioanlity. If 'Nothing', rows will be
+    -- backends that support this functionality. If 'Nothing', rows will be
     -- inserted one-at-a-time using 'connInsertSql'.
-    , connUpsertSql :: Maybe (EntityDef -> Text -> Text)
+    , connUpsertSql :: Maybe (EntityDef -> NonEmpty (HaskellName,DBName) -> Text -> Text)
     -- ^ Some databases support performing UPSERT _and_ RETURN entity
     -- in a single call.
     --
@@ -117,20 +128,39 @@ data SqlBackend = SqlBackend
     --
     -- @since 2.8.1
     , connStmtMap :: IORef (Map Text Statement)
+    -- ^ A reference to the cache of statements. 'Statement's are keyed by
+    -- the 'Text' queries that generated them.
     , connClose :: IO ()
+    -- ^ Close the underlying connection.
     , connMigrateSql
         :: [EntityDef]
         -> (Text -> IO Statement)
         -> EntityDef
         -> IO (Either [Text] [(Bool, Text)])
+    -- ^ This function returns the migrations required to include the
+    -- 'EntityDef' parameter in the @['EntityDef']@ database. This might
+    -- include creating a new table if the entity is not present, or
+    -- altering an existing table if it is.
     , connBegin :: (Text -> IO Statement) -> Maybe IsolationLevel -> IO ()
+    -- ^ A function to begin a transaction for the underlying database.
     , connCommit :: (Text -> IO Statement) -> IO ()
+    -- ^ A function to commit a transaction to the underlying database.
     , connRollback :: (Text -> IO Statement) -> IO ()
+    -- ^ A function to roll back a transaction on the underlying database.
     , connEscapeName :: DBName -> Text
+    -- ^ A function to escape a name for the underlying database. MySQL
+    -- uses backtick characters, while postgresql uses double quoes.
     , connNoLimit :: Text
     , connRDBMS :: Text
+    -- ^ A tag displaying what database the 'SqlBackend' is for. Can be
+    -- used to differentiate features in downstream libraries for different
+    -- database backends.
     , connLimitOffset :: (Int,Int) -> Bool -> Text -> Text
+    -- ^ Attach a 'LIMIT/OFFSET' clause to a SQL query. Note that
+    -- LIMIT/OFFSET is problematic for performance, and indexed range
+    -- queries are the superior way to offer pagination.
     , connLogFunc :: LogFunc
+    -- ^ A log function for the 'SqlBackend' to use.
     , connMaxParams :: Maybe Int
     -- ^ Some databases (probably only Sqlite) have a limit on how
     -- many question-mark parameters may be used in a statement
@@ -149,26 +179,35 @@ data SqlBackend = SqlBackend
     --
     -- @since 2.9.0
     }
-    deriving Typeable
+
 instance HasPersistBackend SqlBackend where
     type BaseBackend SqlBackend = SqlBackend
     persistBackend = id
+
 instance IsPersistBackend SqlBackend where
     mkPersistBackend = id
 
 -- | An SQL backend which can only handle read queries
-newtype SqlReadBackend = SqlReadBackend { unSqlReadBackend :: SqlBackend } deriving Typeable
+--
+-- The constructor was exposed in 2.10.0.
+newtype SqlReadBackend = SqlReadBackend { unSqlReadBackend :: SqlBackend } 
+
 instance HasPersistBackend SqlReadBackend where
     type BaseBackend SqlReadBackend = SqlBackend
     persistBackend = unSqlReadBackend
+
 instance IsPersistBackend SqlReadBackend where
     mkPersistBackend = SqlReadBackend
 
 -- | An SQL backend which can handle read or write queries
-newtype SqlWriteBackend = SqlWriteBackend { unSqlWriteBackend :: SqlBackend } deriving Typeable
+--
+-- The constructor was exposed in 2.10.0
+newtype SqlWriteBackend = SqlWriteBackend { unSqlWriteBackend :: SqlBackend }
+
 instance HasPersistBackend SqlWriteBackend where
     type BaseBackend SqlWriteBackend = SqlBackend
     persistBackend = unSqlWriteBackend
+
 instance IsPersistBackend SqlWriteBackend where
     mkPersistBackend = SqlWriteBackend
 
@@ -192,17 +231,21 @@ readToUnknown ma = do
 
 -- | A constraint synonym which witnesses that a backend is SQL and can run read queries.
 type SqlBackendCanRead backend =
-  ( BackendCompatible SqlBackend backend
-  , PersistQueryRead backend, PersistStoreRead backend, PersistUniqueRead backend
-  )
+    ( BackendCompatible SqlBackend backend
+    , PersistQueryRead backend, PersistStoreRead backend, PersistUniqueRead backend
+    )
+
 -- | A constraint synonym which witnesses that a backend is SQL and can run read and write queries.
 type SqlBackendCanWrite backend =
-  ( SqlBackendCanRead backend
-  , PersistQueryWrite backend, PersistStoreWrite backend, PersistUniqueWrite backend
-  )
+    ( SqlBackendCanRead backend
+    , PersistQueryWrite backend, PersistStoreWrite backend, PersistUniqueWrite backend
+    )
+
 -- | Like @SqlPersistT@ but compatible with any SQL backend which can handle read queries.
 type SqlReadT m a = forall backend. (SqlBackendCanRead backend) => ReaderT backend m a
+
 -- | Like @SqlPersistT@ but compatible with any SQL backend which can handle read and write queries.
 type SqlWriteT m a = forall backend. (SqlBackendCanWrite backend) => ReaderT backend m a
+
 -- | A backend which is a wrapper around @SqlBackend@.
 type IsSqlBackend backend = (IsPersistBackend backend, BaseBackend backend ~ SqlBackend)

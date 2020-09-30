@@ -1,24 +1,25 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 module Main (main) where
 
-import           Control.DeepSeq
-import           Control.DeepSeq.Generics
-import           Criterion.Main
-import           Data.Text                  (Text)
-import qualified Data.Text                  as Text
-import           Language.Haskell.TH
-import           Language.Haskell.TH.Syntax
+import Control.DeepSeq
+import Control.DeepSeq.Generics
+import Criterion.Main
+import Data.Text                  (Text)
+import Language.Haskell.TH
+import Language.Haskell.TH.Syntax
 
-import           Database.Persist.Quasi
-import           Database.Persist.TH
-import           Models
+import Database.Persist.Quasi
+import Database.Persist.TH
+import Models
 
 main :: IO ()
 main = defaultMain
     [ bgroup "mkPersist"
         [ bench "From File" $ nfIO $ mkPersist' $(persistFileWith lowerCaseSettings "bench/models-slowly")
-        --, bgroup "Non-Null Fields"
-        --    , bgroup "Increasing model count"
+        -- , bgroup "Non-Null Fields"
+        --    [ bgroup "Increasing model count"
         --        [ bench "1x10" $ nfIO $ mkPersist' $( parseReferencesQ (mkModels 10 10))
         --        , bench "10x10" $ nfIO $ mkPersist' $(parseReferencesQ (mkModels 10 10))
         --        , bench "100x10" $ nfIO $ mkPersist' $(parseReferencesQ (mkModels 100 10))
@@ -31,7 +32,7 @@ main = defaultMain
         --        -- , bench "10x1000" $ nfIO $ mkPersist' $(parseReferencesQ (mkModels 10 1000))
         --        ]
         --    ]
-        --, bgroup "Nullable"
+        -- , bgroup "Nullable"
         --    [ bgroup "Increasing model count"
         --        [ bench "20x10" $ nfIO $ mkPersist' $(parseReferencesQ (mkNullableModels 20 10))
         --        , bench "40x10" $ nfIO $ mkPersist' $(parseReferencesQ (mkNullableModels 40 10))
@@ -58,13 +59,6 @@ instance NFData Overlap where
 
 instance NFData AnnTarget where
     rnf = genericRnf
-
-instance NFData PatSynDir where
-    rnf = genericRnf
-
-instance NFData PatSynArgs where
-    rnf = genericRnf
-
 instance NFData RuleBndr where
     rnf = genericRnf
 
@@ -122,11 +116,19 @@ instance NFData FunDep where
 instance NFData Bang where
     rnf = genericRnf
 
+#if MIN_VERSION_template_haskell(2,12,0)
+instance NFData PatSynDir where
+    rnf = genericRnf
+
+instance NFData PatSynArgs where
+    rnf = genericRnf
+
 instance NFData DerivStrategy where
     rnf = genericRnf
 
 instance NFData DerivClause where
     rnf = genericRnf
+#endif
 
 instance NFData Con where
     rnf = genericRnf

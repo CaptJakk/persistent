@@ -1,7 +1,5 @@
-{-# LANGUAGE TypeFamilies, FlexibleContexts #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE ExplicitForAll #-}
 module Database.Persist.Class.PersistStore
     ( HasPersistBackend (..)
     , IsPersistBackend (..)
@@ -21,18 +19,19 @@ module Database.Persist.Class.PersistStore
     , BackendCompatible(..)
     ) where
 
-import qualified Data.Text as T
-import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Exception (throwIO)
-import Control.Monad.Trans.Reader (ReaderT)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Reader (MonadReader (ask), runReaderT)
+import Control.Monad.Trans.Reader (ReaderT)
+import qualified Data.Aeson as A
+import Data.Map (Map)
+import qualified Data.Map as Map
+import qualified Data.Maybe as Maybe
+import qualified Data.Text as T
+
 import Database.Persist.Class.PersistEntity
 import Database.Persist.Class.PersistField
 import Database.Persist.Types
-import qualified Data.Aeson as A
-import qualified Data.Map as Map
-import Data.Map (Map)
-import qualified Data.Maybe as Maybe
 
 -- | Class which allows the plucking of a @BaseBackend backend@ from some larger type.
 -- For example,
@@ -100,11 +99,11 @@ class BackendCompatible sup sub where
 type PersistRecordBackend record backend = (PersistEntity record, PersistEntityBackend record ~ BaseBackend backend)
 
 liftPersist
-    :: (MonadIO m, MonadReader backend m, HasPersistBackend backend)
-    => ReaderT (BaseBackend backend) IO b -> m b
+    :: (MonadIO m, MonadReader backend m)
+    => ReaderT backend IO b -> m b
 liftPersist f = do
     env <- ask
-    liftIO $ runReaderT f (persistBackend env)
+    liftIO $ runReaderT f env
 
 -- | 'ToBackendKey' converts a 'PersistEntity' 'Key' into a 'BackendKey'
 -- This can be used by each backend to convert between a 'Key' and a plain
@@ -149,7 +148,7 @@ class
     -- > +------+-----+
     -- > | SPJ  |  40 |
     -- > +------+-----+
-    get :: (MonadIO m, PersistRecordBackend record backend)
+    get :: forall record m. (MonadIO m, PersistRecordBackend record backend)
         => Key record -> ReaderT backend m (Maybe record)
 
     -- | Get many records by their respective identifiers, if available.
@@ -175,7 +174,7 @@ class
     -- > |  2 | Simon |  41 |
     -- > +----+-------+-----+
     getMany
-        :: (MonadIO m, PersistRecordBackend record backend)
+        :: forall record m. (MonadIO m, PersistRecordBackend record backend)
         => [Key record] -> ReaderT backend m (Map (Key record) record)
     getMany [] = return Map.empty
     getMany ks = do
@@ -214,7 +213,7 @@ class
     -- > +-----+------+-----+
     -- > |3    |John  |30   |
     -- > +-----+------+-----+
-    insert :: (MonadIO m, PersistRecordBackend record backend)
+    insert :: forall record m. (MonadIO m, PersistRecordBackend record backend)
            => record -> ReaderT backend m (Key record)
 
     -- | Same as 'insert', but doesn't return a @Key@.
@@ -237,7 +236,7 @@ class
     -- > +-----+------+-----+
     -- > |3    |John  |30   |
     -- > +-----+------+-----+
-    insert_ :: (MonadIO m, PersistRecordBackend record backend)
+    insert_ :: forall record m. (MonadIO m, PersistRecordBackend record backend)
             => record -> ReaderT backend m ()
     insert_ record = insert record >> return ()
 
@@ -275,7 +274,7 @@ class
     -- > +-----+------+-----+
     -- > |5    |Jane  |20   |
     -- > +-----+------+-----+
-    insertMany :: (MonadIO m, PersistRecordBackend record backend)
+    insertMany :: forall record m. (MonadIO m, PersistRecordBackend record backend)
                => [record] -> ReaderT backend m [Key record]
     insertMany = mapM insert
 
@@ -306,7 +305,7 @@ class
     -- > +-----+------+-----+
     -- > |5    |Jane  |20   |
     -- > +-----+------+-----+
-    insertMany_ :: (MonadIO m, PersistRecordBackend record backend)
+    insertMany_ :: forall record m. (MonadIO m, PersistRecordBackend record backend)
                 => [record] -> ReaderT backend m ()
     insertMany_ x = insertMany x >> return ()
 
@@ -338,7 +337,7 @@ class
     -- > +-----+------+-----+
     -- > |4    |Eva   |38   |
     -- > +-----+------+-----+
-    insertEntityMany :: (MonadIO m, PersistRecordBackend record backend)
+    insertEntityMany :: forall record m. (MonadIO m, PersistRecordBackend record backend)
                      => [Entity record] -> ReaderT backend m ()
     insertEntityMany = mapM_ (\(Entity k record) -> insertKey k record)
 
@@ -363,7 +362,7 @@ class
     -- > +-----+------+-----+
     -- > |3    |Alice |20   |
     -- > +-----+------+-----+
-    insertKey :: (MonadIO m, PersistRecordBackend record backend)
+    insertKey :: forall record m. (MonadIO m, PersistRecordBackend record backend)
               => Key record -> record -> ReaderT backend m ()
 
     -- | Put the record in the database with the given key.
@@ -426,7 +425,7 @@ class
     -- > +-----+------+-----+
     -- > |3    |X     |999  |
     -- > +-----+------+-----+
-    repsert :: (MonadIO m, PersistRecordBackend record backend)
+    repsert :: forall record m. (MonadIO m, PersistRecordBackend record backend)
             => Key record -> record -> ReaderT backend m ()
 
     -- | Put many entities into the database.
@@ -457,7 +456,7 @@ class
     -- > |999  |Mr. X           |999      |
     -- > +-----+----------------+---------+
     repsertMany
-        :: (MonadIO m, PersistRecordBackend record backend)
+        :: forall record m. (MonadIO m, PersistRecordBackend record backend)
         => [(Key record, record)] -> ReaderT backend m ()
     repsertMany = mapM_ (uncurry repsert)
 
@@ -482,7 +481,7 @@ class
     -- > +-----+------+-----+
     -- > |2    |Simon |41   |
     -- > +-----+------+-----+
-    replace :: (MonadIO m, PersistRecordBackend record backend)
+    replace :: forall record m. (MonadIO m, PersistRecordBackend record backend)
             => Key record -> record -> ReaderT backend m ()
 
     -- | Delete a specific record by identifier. Does nothing if record does
@@ -502,7 +501,7 @@ class
     -- > +-----+------+-----+
     -- > |2    |Simon |41   |
     -- > +-----+------+-----+
-    delete :: (MonadIO m, PersistRecordBackend record backend)
+    delete :: forall record m. (MonadIO m, PersistRecordBackend record backend)
            => Key record -> ReaderT backend m ()
 
     -- | Update individual fields on a specific record.
@@ -525,7 +524,7 @@ class
     -- > +-----+------+-----+
     -- > |2    |Simon |41   |
     -- > +-----+------+-----+
-    update :: (MonadIO m, PersistRecordBackend record backend)
+    update :: forall record m. (MonadIO m, PersistRecordBackend record backend)
            => Key record -> [Update record] -> ReaderT backend m ()
 
     -- | Update individual fields on a specific record, and retrieve the
@@ -552,7 +551,7 @@ class
     -- > +-----+------+-----+
     -- > |2    |Simon |41   |
     -- > +-----+------+-----+
-    updateGet :: (MonadIO m, PersistRecordBackend record backend)
+    updateGet :: forall record m. (MonadIO m, PersistRecordBackend record backend)
               => Key record -> [Update record] -> ReaderT backend m record
     updateGet key ups = do
         update key ups
@@ -585,11 +584,11 @@ class
 -- mrx <- getJustUnknown
 --
 -- This just throws an error.
-getJust :: ( PersistStoreRead backend
-           , Show (Key record)
-           , PersistRecordBackend record backend
-           , MonadIO m
-           ) => Key record -> ReaderT backend m record
+getJust :: forall record backend m.
+  ( PersistStoreRead backend
+  , PersistRecordBackend record backend
+  , MonadIO m)
+  => Key record -> ReaderT backend m record
 getJust key = get key >>= maybe
   (liftIO $ throwIO $ PersistForeignConstraintUnmet $ T.pack $ show key)
   return
@@ -614,11 +613,11 @@ getJust key = get key >>= maybe
 -- > +----+------+-----+
 -- > |  1 | SPJ  |  40 |
 -- > +----+------+-----+
-getJustEntity
-  :: (PersistEntityBackend record ~ BaseBackend backend
-     ,MonadIO m
-     ,PersistEntity record
-     ,PersistStoreRead backend)
+getJustEntity :: forall record backend m.
+  ( PersistEntityBackend record ~ BaseBackend backend
+  , MonadIO m
+  , PersistEntity record
+  , PersistStoreRead backend)
   => Key record -> ReaderT backend m (Entity record)
 getJustEntity key = do
   record <- getJust key
@@ -631,7 +630,7 @@ getJustEntity key = do
 -- | Curry this to make a convenience function that loads an associated model.
 --
 -- > foreign = belongsTo foreignId
-belongsTo ::
+belongsTo :: forall ent1 ent2 backend m.
   ( PersistStoreRead backend
   , PersistEntity ent1
   , PersistRecordBackend ent2 backend
@@ -642,7 +641,7 @@ belongsTo foreignKeyField model = case foreignKeyField model of
     Just f -> get f
 
 -- | Same as 'belongsTo', but uses @getJust@ and therefore is similarly unsafe.
-belongsToJust ::
+belongsToJust :: forall ent1 ent2 backend m.
   ( PersistStoreRead backend
   , PersistEntity ent1
   , PersistRecordBackend ent2 backend
@@ -673,7 +672,7 @@ belongsToJust getForeignKey model = getJust $ getForeignKey model
 -- > +----+---------+-----+
 -- > |  3 | Haskell |  81 |
 -- > +----+---------+-----+
-insertEntity ::
+insertEntity :: forall e backend m.
     ( PersistStoreWrite backend
     , PersistRecordBackend e backend
     , MonadIO m
@@ -700,7 +699,7 @@ insertEntity e = do
 -- > +----+------+-----+
 -- > |  1 | SPJ  |  40 |
 -- > +----+------+-----+
-getEntity ::
+getEntity :: forall e backend m.
     ( PersistStoreRead backend
     , PersistRecordBackend e backend
     , MonadIO m
@@ -734,7 +733,7 @@ getEntity key = do
 -- > |3    |Dave  |50   |
 -- > +-----+------+-----+
 insertRecord
-  :: (PersistEntityBackend record ~ BaseBackend backend
+  :: forall record backend m. (PersistEntityBackend record ~ BaseBackend backend
      ,PersistEntity record
      ,MonadIO m
      ,PersistStoreWrite backend)

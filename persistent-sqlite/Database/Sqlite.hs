@@ -1,6 +1,5 @@
-{-# LANGUAGE ForeignFunctionInterface, DeriveDataTypeable #-}
+{-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE CPP #-}
 -- | A port of the direct-sqlite package for dealing directly with
 -- 'PersistValue's.
 module Database.Sqlite  (
@@ -8,8 +7,7 @@ module Database.Sqlite  (
                          Statement,
                          Error(..),
                          SqliteException(..),
-                         StepResult(Row,
-                                    Done),
+                         StepResult(Row, Done),
                          Config(ConfigLogFn),
                          LogFunction,
                          SqliteStatus (..),
@@ -81,33 +79,23 @@ module Database.Sqlite  (
 
 import Prelude hiding (error)
 import qualified Prelude as P
-import qualified Prelude
+
+import Control.Exception (Exception, throwIO)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
 import qualified Data.ByteString.Internal as BSI
-import Foreign
-import Foreign.C
-import Control.Exception (Exception, throwIO)
-import Control.Applicative as A ((<$>))
-import Database.Persist (PersistValue (..), listToJSON, mapToJSON)
+import Data.Fixed (Pico)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Monoid (mappend, mconcat)
 import Data.Text (Text, pack, unpack)
 import Data.Text.Encoding (encodeUtf8, decodeUtf8With)
 import Data.Text.Encoding.Error (lenientDecode)
-import Data.Monoid (mappend, mconcat)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Fixed (Pico)
-import Data.Time (formatTime, UTCTime)
-import Data.Typeable (Typeable)
+import Data.Time (defaultTimeLocale, formatTime, UTCTime)
+import Database.Sqlite.Internal (Connection(..), Connection'(..), Statement(..))
+import Foreign
+import Foreign.C
 
-#if MIN_VERSION_time(1,5,0)
-import Data.Time (defaultTimeLocale)
-#else
-import System.Locale (defaultTimeLocale)
-#endif
-
-data Connection = Connection !(IORef Bool) Connection'
-newtype Connection' = Connection' (Ptr ())
-newtype Statement = Statement (Ptr ())
+import Database.Persist (PersistValue (..), listToJSON, mapToJSON)
 
 -- | A custom exception type to make it easier to catch exceptions.
 --
@@ -117,7 +105,7 @@ data SqliteException = SqliteException
     , seFunctionName :: !Text
     , seDetails      :: !Text
     }
-    deriving (Typeable)
+
 instance Show SqliteException where
     show (SqliteException error functionName details) = unpack $ Data.Monoid.mconcat
         ["SQLite3 returned "
@@ -198,7 +186,7 @@ decodeError 25 = ErrorRange
 decodeError 26 = ErrorNotAConnection
 decodeError 100 = ErrorRow
 decodeError 101 = ErrorDone
-decodeError i = Prelude.error $ "decodeError " ++ show i
+decodeError i = P.error $ "decodeError " ++ show i
 
 decodeColumnType :: Int -> ColumnType
 decodeColumnType 1 = IntegerColumn
@@ -206,7 +194,7 @@ decodeColumnType 2 = FloatColumn
 decodeColumnType 3 = TextColumn
 decodeColumnType 4 = BlobColumn
 decodeColumnType 5 = NullColumn
-decodeColumnType i = Prelude.error $ "decodeColumnType " ++ show i
+decodeColumnType i = P.error $ "decodeColumnType " ++ show i
 
 foreign import ccall "sqlite3_errmsg"
   errmsgC :: Ptr () -> IO CString
@@ -236,7 +224,7 @@ openError :: Text -> IO (Either Connection Error)
 openError path' = do
     let flag = sqliteFlagReadWrite .|. sqliteFlagCreate .|. sqliteFlagUri
     BS.useAsCString (encodeUtf8 path') $ \path -> alloca $ \database -> do
-        err <- decodeError A.<$> openC path database flag nullPtr
+        err <- decodeError <$> openC path database flag nullPtr
         case err of
             ErrorOK -> do database' <- peek database
                           active <- newIORef True
@@ -480,6 +468,7 @@ bind statement sqlData = do
             PersistList l -> bindText statement parameterIndex $ listToJSON l
             PersistMap m -> bindText statement parameterIndex $ mapToJSON m
             PersistDbSpecific s -> bindText statement parameterIndex $ decodeUtf8With lenientDecode s
+            PersistArray a -> bindText statement parameterIndex $ listToJSON a -- copy of PersistList's definition
             PersistObjectId _ -> P.error "Refusing to serialize a PersistObjectId to a SQLite value"
             )
        $ zip [1..] sqlData
@@ -526,7 +515,8 @@ foreign import ccall "sqlite3_column_text"
 columnText :: Statement -> Int -> IO Text
 columnText (Statement statement) columnIndex = do
   text <- columnTextC statement columnIndex
-  byteString <- BS.packCString text
+  len <- columnBytesC statement columnIndex
+  byteString <- BS.packCStringLen (text, len)
   return $ decodeUtf8With lenientDecode byteString
 
 foreign import ccall "sqlite3_column_count"

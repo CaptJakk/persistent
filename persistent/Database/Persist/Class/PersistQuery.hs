@@ -1,7 +1,4 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ExplicitForAll #-}
 module Database.Persist.Class.PersistQuery
     ( PersistQueryRead (..)
     , PersistQueryWrite (..)
@@ -11,16 +8,15 @@ module Database.Persist.Class.PersistQuery
     , selectKeysList
     ) where
 
-import Database.Persist.Types
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Reader   (ReaderT, MonadReader)
-
-import Data.Conduit (ConduitM, (.|), await, runConduit)
-import qualified Data.Conduit.List as CL
-import Database.Persist.Class.PersistStore
-import Database.Persist.Class.PersistEntity
 import Control.Monad.Trans.Resource (MonadResource, release)
 import Data.Acquire (Acquire, allocateAcquire, with)
+import Data.Conduit (ConduitM, (.|), await, runConduit)
+import qualified Data.Conduit.List as CL
+
+import Database.Persist.Class.PersistStore
+import Database.Persist.Class.PersistEntity
 
 -- | Backends supporting conditional read operations.
 class (PersistCore backend, PersistStoreRead backend) => PersistQueryRead backend where
@@ -65,7 +61,7 @@ class (PersistQueryRead backend, PersistStoreWrite backend) => PersistQueryWrite
 -- | Get all records matching the given criterion in the specified order.
 -- Returns also the identifiers.
 selectSource
-       :: (PersistQueryRead (BaseBackend backend), MonadResource m, PersistEntity record, PersistEntityBackend record ~ BaseBackend (BaseBackend backend), MonadReader backend m, HasPersistBackend backend)
+       :: forall record backend m. (PersistQueryRead backend, MonadResource m, PersistRecordBackend record backend, MonadReader backend m)
        => [Filter record]
        -> [SelectOpt record]
        -> ConduitM () (Entity record) m ()
@@ -76,7 +72,7 @@ selectSource filts opts = do
     release releaseKey
 
 -- | Get the 'Key's of all records matching the given criterion.
-selectKeys :: (PersistQueryRead (BaseBackend backend), MonadResource m, PersistEntity record, BaseBackend (BaseBackend backend) ~ PersistEntityBackend record, MonadReader backend m, HasPersistBackend backend)
+selectKeys :: forall record backend m. (PersistQueryRead backend, MonadResource m, PersistRecordBackend record backend, MonadReader backend m)
            => [Filter record]
            -> [SelectOpt record]
            -> ConduitM () (Key record) m ()
@@ -87,7 +83,7 @@ selectKeys filts opts = do
     release releaseKey
 
 -- | Call 'selectSource' but return the result as a list.
-selectList :: (MonadIO m, PersistQueryRead backend, PersistRecordBackend record backend)
+selectList :: forall record backend m. (MonadIO m, PersistQueryRead backend, PersistRecordBackend record backend)
            => [Filter record]
            -> [SelectOpt record]
            -> ReaderT backend m [Entity record]
@@ -96,7 +92,7 @@ selectList filts opts = do
     liftIO $ with srcRes (\src -> runConduit $ src .| CL.consume)
 
 -- | Call 'selectKeys' but return the result as a list.
-selectKeysList :: (MonadIO m, PersistQueryRead backend, PersistRecordBackend record backend)
+selectKeysList :: forall record backend m. (MonadIO m, PersistQueryRead backend, PersistRecordBackend record backend)
                => [Filter record]
                -> [SelectOpt record]
                -> ReaderT backend m [Key record]

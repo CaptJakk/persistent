@@ -1,11 +1,10 @@
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE FlexibleContexts #-}
 -- | A MySQL backend for @persistent@.
 module Database.Persist.MySQL
     ( withMySQLPool
@@ -21,12 +20,8 @@ module Database.Persist.MySQL
      -- * @ON DUPLICATE KEY UPDATE@ Functionality
     , insertOnDuplicateKeyUpdate
     , insertManyOnDuplicateKeyUpdate
-#if MIN_VERSION_base(4,7,0)
     , HandleUpdateCollision
     , pattern SomeField
-#elif MIN_VERSION_base(4,9,0)
-    , HandleUpdateCollision(SomeField)
-#endif
     , SomeField
     , copyField
     , copyUnlessNull
@@ -34,65 +29,67 @@ module Database.Persist.MySQL
     , copyUnlessEq
     ) where
 
+import qualified Debug.Trace as Debug
+
+import qualified Blaze.ByteString.Builder.Char8 as BBB
+import qualified Blaze.ByteString.Builder.ByteString as BBS
+
 import Control.Arrow
 import Control.Monad
-import Control.Monad.Logger (MonadLogger, runNoLoggingT)
 import Control.Monad.IO.Class (MonadIO (..))
+import Control.Monad.IO.Unlift (MonadUnliftIO)
+import Control.Monad.Logger (MonadLogger, runNoLoggingT)
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Except (runExceptT)
+import Control.Monad.Trans.Except (ExceptT, runExceptT)
 import Control.Monad.Trans.Reader (runReaderT, ReaderT)
 import Control.Monad.Trans.Writer (runWriterT)
-import Data.Either (partitionEithers)
-import Data.Monoid ((<>))
-import qualified Data.Monoid as Monoid
+
+import GHC.Stack
+import Data.Conduit
+import qualified Data.Conduit.List as CL
+import Data.Acquire (Acquire, mkAcquire, with)
 import Data.Aeson
 import Data.Aeson.Types (modifyFailure)
 import Data.ByteString (ByteString)
+import Data.Either (partitionEithers)
 import Data.Fixed (Pico)
 import Data.Function (on)
+import Data.Int (Int64)
 import Data.IORef
 import Data.List (find, intercalate, sort, groupBy)
+import qualified Data.Map as Map
+import Data.Maybe (listToMaybe, mapMaybe, fromMaybe)
+import Data.Monoid ((<>))
+import qualified Data.Monoid as Monoid
 import Data.Pool (Pool)
 import Data.Text (Text, pack)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import qualified Data.Text.IO as T
 import Text.Read (readMaybe)
 import System.Environment (getEnvironment)
-import Data.Acquire (Acquire, mkAcquire, with)
-
-import Data.Conduit
-import qualified Blaze.ByteString.Builder.Char8 as BBB
-import qualified Blaze.ByteString.Builder.ByteString as BBS
-import qualified Data.Conduit.List as CL
-import qualified Data.Map as Map
-import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
 
 import Database.Persist.Sql
-import Database.Persist.Sql.Types.Internal (mkPersistBackend, makeIsolationLevelStatement)
+import Database.Persist.Sql.Types.Internal (makeIsolationLevelStatement)
 import qualified Database.Persist.Sql.Util as Util
-import Data.Int (Int64)
 
+import qualified Database.MySQL.Base          as MySQLBase
+import qualified Database.MySQL.Base.Types    as MySQLBase
 import qualified Database.MySQL.Simple        as MySQL
 import qualified Database.MySQL.Simple.Param  as MySQL
 import qualified Database.MySQL.Simple.Result as MySQL
 import qualified Database.MySQL.Simple.Types  as MySQL
 
-import qualified Database.MySQL.Base          as MySQLBase
-import qualified Database.MySQL.Base.Types    as MySQLBase
-import Control.Monad.IO.Unlift (MonadUnliftIO)
-
-import Prelude
-
 -- | Create a MySQL connection pool and run the given action.
 -- The pool is properly released after the action finishes using
 -- it.  Note that you should not use the given 'ConnectionPool'
 -- outside the action since it may be already been released.
-withMySQLPool :: (MonadLogger m, MonadUnliftIO m, IsSqlBackend backend)
+withMySQLPool :: (MonadLogger m, MonadUnliftIO m)
               => MySQL.ConnectInfo
               -- ^ Connection information.
               -> Int
               -- ^ Number of connections to be kept open in the pool.
-              -> (Pool backend -> m a)
+              -> (Pool SqlBackend -> m a)
               -- ^ Action to be executed that uses the connection pool.
               -> m a
 withMySQLPool ci = withSqlPool $ open' ci
@@ -101,21 +98,21 @@ withMySQLPool ci = withSqlPool $ open' ci
 -- | Create a MySQL connection pool.  Note that it's your
 -- responsibility to properly close the connection pool when
 -- unneeded.  Use 'withMySQLPool' for automatic resource control.
-createMySQLPool :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
+createMySQLPool :: (MonadUnliftIO m, MonadLogger m)
                 => MySQL.ConnectInfo
                 -- ^ Connection information.
                 -> Int
                 -- ^ Number of connections to be kept open in the pool.
-                -> m (Pool backend)
+                -> m (Pool SqlBackend)
 createMySQLPool ci = createSqlPool $ open' ci
 
 
 -- | Same as 'withMySQLPool', but instead of opening a pool
 -- of connections, only one connection is opened.
-withMySQLConn :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
+withMySQLConn :: (MonadUnliftIO m, MonadLogger m)
               => MySQL.ConnectInfo
               -- ^ Connection information.
-              -> (backend -> m a)
+              -> (SqlBackend -> m a)
               -- ^ Action to be executed that uses the connection.
               -> m a
 withMySQLConn = withSqlConn . open'
@@ -123,12 +120,12 @@ withMySQLConn = withSqlConn . open'
 
 -- | Internal function that opens a connection to the MySQL
 -- server.
-open' :: (IsSqlBackend backend) => MySQL.ConnectInfo -> LogFunc -> IO backend
+open' :: MySQL.ConnectInfo -> LogFunc -> IO SqlBackend
 open' ci logFunc = do
     conn <- MySQL.connect ci
     MySQLBase.autocommit conn False -- disable autocommit!
     smap <- newIORef $ Map.empty
-    return . mkPersistBackend $ SqlBackend
+    return $ SqlBackend
         { connPrepare    = prepare' conn
         , connStmtMap    = smap
         , connInsertSql  = insertSql'
@@ -210,9 +207,9 @@ withStmt' conn query vals = do
       let getters = [ maybe PersistNull (getGetter f f . Just) | f <- fields]
           convert = use getters
             where use (g:gs) (col:cols) =
-                    let v  = g col
-                        vs = use gs cols
-                    in v `seq` vs `seq` (v:vs)
+                    let !v  = g col
+                        !vs = use gs cols
+                    in (v:vs)
                   use _ _ = []
 
       -- Ready to go!
@@ -220,8 +217,8 @@ withStmt' conn query vals = do
             row <- MySQLBase.fetchRow result
             case row of
               [] -> return (acc [])
-              _  -> let converted = convert row
-                    in converted `seq` go (acc . (converted:))
+              _  -> let !converted = convert row
+                    in go (acc . (converted:))
       go id
 
 
@@ -243,8 +240,9 @@ instance MySQL.Param P where
     render (P (PersistMap m))         = MySQL.render $ mapToJSON m
     render (P (PersistRational r))    =
       MySQL.Plain $ BBB.fromString $ show (fromRational r :: Pico)
-      -- FIXME: Too Ambigous, can not select precision without information about field
+      -- FIXME: Too Ambiguous, can not select precision without information about field
     render (P (PersistDbSpecific s))    = MySQL.Plain $ BBS.fromByteString s
+    render (P (PersistArray a))       = MySQL.render (P (PersistList a))
     render (P (PersistObjectId _))    =
         error "Refusing to serialize a PersistObjectId to a MySQL value"
 
@@ -337,42 +335,93 @@ migrate' :: MySQL.ConnectInfo
          -> IO (Either [Text] [(Bool, Text)])
 migrate' connectInfo allDefs getter val = do
     let name = entityDB val
-    (idClmn, old) <- getColumns connectInfo getter val
-    let (newcols, udefs, fdefs) = mkColumns allDefs val
+    let (newcols, udefs, fdefs) = mysqlMkColumns allDefs val
+    old <- getColumns connectInfo getter val newcols
     let udspair = map udToPair udefs
-    case (idClmn, old, partitionEithers old) of
-      -- Nothing found, create everything
-      ([], [], _) -> do
-        let uniques = flip concatMap udspair $ \(uname, ucols) ->
-                      [ AlterTable name $
-                        AddUniqueConstraint uname $
-                        map (findTypeAndMaxLen name) ucols ]
-        let foreigns = do
-              Column { cName=cname, cReference=Just (refTblName, _a) } <- newcols
-              return $ AlterColumn name (refTblName, addReference allDefs (refName name cname) refTblName cname)
+    case ([], old, partitionEithers old) of
+        -- Nothing found, create everything
+        ([], [], _) -> do
+            let uniques = do
+                    (uname, ucols) <- udspair
+                    pure
+                        $ AlterTable name
+                        $ AddUniqueConstraint uname
+                        $ map (findTypeAndMaxLen name) ucols
 
-        let foreignsAlt = map (\fdef -> let (childfields, parentfields) = unzip (map (\((_,b),(_,d)) -> (b,d)) (foreignFields fdef))
-                                        in AlterColumn name (foreignRefTableDBName fdef, AddReference (foreignRefTableDBName fdef) (foreignConstraintNameDBName fdef) childfields parentfields)) fdefs
+            let foreigns = do
+                    Column { cName=cname, cReference=Just (refTblName, refConstraintName) } <- newcols
+                    let refTarget =
+                          addReference allDefs refConstraintName refTblName cname
 
-        return $ Right $ map showAlterDb $ (addTable newcols val): uniques ++ foreigns ++ foreignsAlt
-      -- No errors and something found, migrate
-      (_, _, ([], old')) -> do
-        let excludeForeignKeys (xs,ys) = (map (\c -> case cReference c of
-                                                    Just (_,fk) -> case find (\f -> fk == foreignConstraintNameDBName f) fdefs of
-                                                                     Just _ -> c { cReference = Nothing }
-                                                                     Nothing -> c
-                                                    Nothing -> c) xs,ys)
-            (acs, ats) = getAlters allDefs name (newcols, udspair) $ excludeForeignKeys $ partitionEithers old'
-            acs' = map (AlterColumn name) acs
-            ats' = map (AlterTable  name) ats
-        return $ Right $ map showAlterDb $ acs' ++ ats'
-      -- Errors
-      (_, _, (errs, _)) -> return $ Left errs
+                    guard $ refTblName /= name && cname /= fieldDB (entityId val)
+                    return $ Debug.traceShowId $ AlterColumn name (refTblName, refTarget)
+
+            let foreignsAlt =
+                    map
+                        (\fdef ->
+                            let (childfields, parentfields) =
+                                    unzip
+                                    $ map (\((_,b),(_,d)) -> (b,d))
+                                    $ foreignFields fdef
+                            in
+                                AlterColumn
+                                    name
+                                    ( foreignRefTableDBName fdef
+                                    , AddReference
+                                        (foreignRefTableDBName fdef)
+                                        (foreignConstraintNameDBName fdef)
+                                        childfields parentfields
+                                    )
+                        )
+                        fdefs
+
+            return
+                $ Right
+                $ map showAlterDb
+                $ (addTable newcols val) : uniques ++ foreigns ++ foreignsAlt
+
+        -- No errors and something found, migrate
+        (_, _, ([], old')) -> do
+            let excludeForeignKeys (xs,ys) =
+                    ( map
+                        (\c ->
+                            case cReference c of
+                                Just (_,fk) ->
+                                    case find (\f -> fk == foreignConstraintNameDBName f) fdefs of
+                                        Just _ -> c { cReference = Nothing }
+                                        Nothing -> c
+                                Nothing -> c
+                        )
+                        xs
+                    , ys
+                    )
+                (acs, ats) =
+                    getAlters
+                        allDefs
+                        val
+                        (newcols, udspair)
+                        $ excludeForeignKeys
+                        $ partitionEithers
+                        $ old'
+                acs' =
+                    map (AlterColumn name) acs
+                ats' =
+                    map (AlterTable  name) ats
+            return
+                $ Right
+                $ map showAlterDb
+                $ acs' ++ ats'
+
+        -- Errors
+        (_, _, (errs, _)) ->
+            return $ Left errs
 
       where
-        findTypeAndMaxLen tblName col = let (col', ty) = findTypeOfColumn allDefs tblName col
-                                            (_, ml) = findMaxLenOfColumn allDefs tblName col
-                                         in (col', ty, ml)
+        findTypeAndMaxLen tblName col =
+            let (col', ty) = findTypeOfColumn allDefs tblName col
+                (_, ml) = findMaxLenOfColumn allDefs tblName col
+            in
+                (col', ty, ml)
 
 addTable :: [Column] -> EntityDef -> AlterDB
 addTable cols entity = AddTable $ concat
@@ -381,11 +430,13 @@ addTable cols entity = AddTable $ concat
            , escapeDBName name
            , "("
            , idtxt
-           , if null cols then [] else ","
-           , intercalate "," $ map showColumn cols
+           , if null nonIdCols then [] else ","
+           , intercalate "," $ map showColumn nonIdCols
            , ")"
            ]
     where
+      nonIdCols =
+          filter (\c -> cName c /= fieldDB (entityId entity) ) cols
       name = entityDB entity
       idtxt = case entityPrimary entity of
                 Just pdef -> concat [" PRIMARY KEY (", intercalate "," $ map (escapeDBName . fieldDB) $ compositeFields pdef, ")"]
@@ -407,10 +458,13 @@ addTable cols entity = AddTable $ concat
 -- | Find out the type of a column.
 findTypeOfColumn :: [EntityDef] -> DBName -> DBName -> (DBName, FieldType)
 findTypeOfColumn allDefs name col =
-    maybe (error $ "Could not find type of column " ++
+    maybe
+        (error $ "Could not find type of column " ++
                    show col ++ " on table " ++ show name ++
-                   " (allDefs = " ++ show allDefs ++ ")")
-          ((,) col) $ do
+                   " (allDefs = " ++ show allDefs ++ ")"
+        )
+        ((,) col)
+        $ do
             entDef   <- find ((== name) . entityDB) allDefs
             fieldDef <- find ((== col)  . fieldDB) (entityFields entDef)
             return (fieldType fieldDef)
@@ -427,18 +481,25 @@ findMaxLenOfColumn allDefs name col =
 -- | Find out the maxlen of a field
 findMaxLenOfField :: FieldDef -> Maybe Integer
 findMaxLenOfField fieldDef = do
-    maxLenAttr <- find ((T.isPrefixOf "maxlen=") . T.toLower) (fieldAttrs fieldDef)
-    readMaybe . T.unpack . T.drop 7 $ maxLenAttr
+    maxLenAttr <- listToMaybe
+        . mapMaybe (T.stripPrefix "maxlen=" . T.toLower)
+        . fieldAttrs
+        $ fieldDef
+    readMaybe $ T.unpack maxLenAttr
 
 -- | Helper for 'AddReference' that finds out the which primary key columns to reference.
 addReference :: [EntityDef] -> DBName -> DBName -> DBName -> AlterColumn
-addReference allDefs fkeyname reftable cname = AddReference reftable fkeyname [cname] referencedColumns
-    where
-      referencedColumns = maybe (error $ "Could not find ID of entity " ++ show reftable
-                                  ++ " (allDefs = " ++ show allDefs ++ ")")
-                                id $ do
-                                  entDef <- find ((== reftable) . entityDB) allDefs
-                                  return $ map fieldDB $ entityKeyFields entDef
+addReference allDefs fkeyname reftable cname =
+    AddReference reftable fkeyname [cname] referencedColumns
+  where
+    errorMessage =
+        error
+            $ "Could not find ID of entity " ++ show reftable
+            ++ " (allDefs = " ++ show allDefs ++ ")"
+    referencedColumns =
+        fromMaybe errorMessage $ do
+            entDef <- find ((== reftable) . entityDB) allDefs
+            return $ map fieldDB $ entityKeyFields entDef
 
 data AlterColumn = Change Column
                  | Add' Column
@@ -453,15 +514,18 @@ data AlterColumn = Change Column
                     [DBName] -- Referencing columns
                     [DBName] -- Referenced columns
                  | DropReference DBName
+                 deriving Show
 
 type AlterColumn' = (DBName, AlterColumn)
 
 data AlterTable = AddUniqueConstraint DBName [(DBName, FieldType, Integer)]
                 | DropUniqueConstraint DBName
+                deriving Show
 
 data AlterDB = AddTable String
              | AlterColumn DBName AlterColumn'
              | AlterTable DBName AlterTable
+             deriving Show
 
 
 udToPair :: UniqueDef -> (DBName, [DBName])
@@ -472,26 +536,13 @@ udToPair ud = (uniqueDBName ud, map snd $ uniqueFields ud)
 
 -- | Returns all of the 'Column'@s@ in the given table currently
 -- in the database.
-getColumns :: MySQL.ConnectInfo
-           -> (Text -> IO Statement)
-           -> EntityDef
-           -> IO ( [Either Text (Either Column (DBName, [DBName]))] -- ID column
-                 , [Either Text (Either Column (DBName, [DBName]))] -- everything else
-                 )
-getColumns connectInfo getter def = do
-    -- Find out ID column.
-    stmtIdClmn <- getter $ T.concat
-      [ "SELECT COLUMN_NAME, "
-      ,   "IS_NULLABLE, "
-      ,   "DATA_TYPE, "
-      ,   "COLUMN_DEFAULT "
-      , "FROM INFORMATION_SCHEMA.COLUMNS "
-      , "WHERE TABLE_SCHEMA = ? "
-      ,   "AND TABLE_NAME   = ? "
-      ,   "AND COLUMN_NAME  = ?"
-      ]
-    inter1 <- with (stmtQuery stmtIdClmn vals) (\src -> runConduit $ src .| CL.consume)
-    ids <- runConduitRes $ CL.sourceList inter1 .| helperClmns -- avoid nested queries
+getColumns
+    :: HasCallStack
+    => MySQL.ConnectInfo
+    -> (Text -> IO Statement)
+    -> EntityDef -> [Column]
+    -> IO [Either Text (Either Column (DBName, [DBName]))]
+getColumns connectInfo getter def cols = do
 
     -- Find out all columns.
     stmtClmns <- getter $ T.concat
@@ -506,7 +557,7 @@ getColumns connectInfo getter def = do
       , "FROM INFORMATION_SCHEMA.COLUMNS "
       , "WHERE TABLE_SCHEMA = ? "
       ,   "AND TABLE_NAME   = ? "
-      ,   "AND COLUMN_NAME <> ?"
+      -- ,   "AND COLUMN_NAME <> ?"
       ]
     inter2 <- with (stmtQuery stmtClmns vals) (\src -> runConduitRes $ src .| CL.consume)
     cs <- runConduitRes $ CL.sourceList inter2 .| helperClmns -- avoid nested queries
@@ -518,7 +569,7 @@ getColumns connectInfo getter def = do
       , "FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
       , "WHERE TABLE_SCHEMA = ? "
       ,   "AND TABLE_NAME   = ? "
-      ,   "AND COLUMN_NAME <> ? "
+      -- ,   "AND COLUMN_NAME <> ? "
       ,   "AND CONSTRAINT_NAME <> 'PRIMARY' "
       ,   "AND REFERENCED_TABLE_SCHEMA IS NULL "
       , "ORDER BY CONSTRAINT_NAME, "
@@ -527,17 +578,25 @@ getColumns connectInfo getter def = do
     us <- with (stmtQuery stmtCntrs vals) (\src -> runConduitRes $ src .| helperCntrs)
 
     -- Return both
-    return (ids, cs ++ us)
+    return (cs ++ us)
   where
+    refMap = Map.fromList $ foldl ref [] cols
+      where ref rs c = case cReference c of
+                Nothing -> rs
+                (Just r) -> (unDBName $ cName c, r) : rs
     vals = [ PersistText $ pack $ MySQL.connectDatabase connectInfo
            , PersistText $ unDBName $ entityDB def
-           , PersistText $ unDBName $ fieldDB $ entityId def ]
+        --   , PersistText $ unDBName $ fieldDB $ entityId def
+           ]
 
     helperClmns = CL.mapM getIt .| CL.consume
         where
-          getIt = fmap (either Left (Right . Left)) .
-                  liftIO .
-                  getColumn connectInfo getter (entityDB def)
+          getIt row = fmap (either Left (Right . Left)) .
+                      liftIO .
+                      getColumn connectInfo getter (entityDB def) row $ ref
+            where ref = case row of
+                    (PersistText cname : _) -> (Map.lookup cname refMap)
+                    _ -> Nothing
 
     helperCntrs = do
       let check [ PersistText cntrName
@@ -549,11 +608,14 @@ getColumns connectInfo getter def = do
 
 
 -- | Get the information about a column in a table.
-getColumn :: MySQL.ConnectInfo
-          -> (Text -> IO Statement)
-          -> DBName
-          -> [PersistValue]
-          -> IO (Either Text Column)
+getColumn
+    :: HasCallStack
+    => MySQL.ConnectInfo
+    -> (Text -> IO Statement)
+    -> DBName
+    -> [PersistValue]
+    -> Maybe (DBName, DBName)
+    -> IO (Either Text Column)
 getColumn connectInfo getter tname [ PersistText cname
                                    , PersistText null_
                                    , PersistText dataType
@@ -561,7 +623,7 @@ getColumn connectInfo getter tname [ PersistText cname
                                    , colMaxLen
                                    , colPrecision
                                    , colScale
-                                   , default'] =
+                                   , default'] refName =
     fmap (either (Left . pack) Right) $
     runExceptT $ do
       -- Default value
@@ -576,30 +638,7 @@ getColumn connectInfo getter tname [ PersistText cname
                         Right t  -> return (Just t)
                     _ -> fail $ "Invalid default column: " ++ show default'
 
-      -- Foreign key (if any)
-      stmt <- lift . getter $ T.concat
-        [ "SELECT REFERENCED_TABLE_NAME, "
-        ,   "CONSTRAINT_NAME, "
-        ,   "ORDINAL_POSITION "
-        , "FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
-        , "WHERE TABLE_SCHEMA = ? "
-        ,   "AND TABLE_NAME   = ? "
-        ,   "AND COLUMN_NAME  = ? "
-        ,   "AND REFERENCED_TABLE_SCHEMA = ? "
-        , "ORDER BY CONSTRAINT_NAME, "
-        ,   "COLUMN_NAME"
-        ]
-      let vars = [ PersistText $ pack $ MySQL.connectDatabase connectInfo
-                 , PersistText $ unDBName $ tname
-                 , PersistText cname
-                 , PersistText $ pack $ MySQL.connectDatabase connectInfo ]
-      cntrs <- liftIO $ with (stmtQuery stmt vars) (\src -> runConduit $ src .| CL.consume)
-      ref <- case cntrs of
-               [] -> return Nothing
-               [[PersistText tab, PersistText ref, PersistInt64 pos]] ->
-                   return $ if pos == 1 then Just (DBName tab, DBName ref) else Nothing
-               _ -> fail "MySQL.getColumn/getRef: never here"
-
+      ref <- getRef refName
       let colMaxLen' = case colMaxLen of
             PersistInt64 l -> Just (fromIntegral l)
             _ -> Nothing
@@ -620,8 +659,42 @@ getColumn connectInfo getter tname [ PersistText cname
         , cMaxLen = maxLen
         , cReference = ref
         }
+  where getRef Nothing = return Nothing
+        getRef (Just (_, refName')) = do
+          -- Foreign key (if any)
+          stmt <- lift . getter $ T.concat
+            [ "SELECT REFERENCED_TABLE_NAME, "
+            ,   "CONSTRAINT_NAME, "
+            ,   "ORDINAL_POSITION "
+            , "FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
+            , "WHERE TABLE_SCHEMA = ? "
+            ,   "AND TABLE_NAME   = ? "
+            ,   "AND COLUMN_NAME  = ? "
+            ,   "AND REFERENCED_TABLE_SCHEMA = ? "
+            ,   "AND CONSTRAINT_NAME = ? "
+            , "ORDER BY CONSTRAINT_NAME, "
+            ,   "COLUMN_NAME"
+            ]
+          let vars = [ PersistText $ pack $ MySQL.connectDatabase connectInfo
+                     , PersistText $ unDBName $ tname
+                     , PersistText cname
+                     , PersistText $ pack $ MySQL.connectDatabase connectInfo
+                     , PersistText $ unDBName refName' ]
+          cntrs <- liftIO $ with (stmtQuery stmt vars) (\src -> runConduit $ src .| CL.consume)
+          case cntrs of
+            [] -> return Nothing
+            [[PersistText tab, PersistText ref, PersistInt64 pos]] ->
+              return $ if pos == 1 then Just (DBName tab, DBName ref) else Nothing
+            xs -> error $ mconcat
+              [ "MySQL.getColumn/getRef: error fetching constraints. Expected a single result for foreign key query for table: "
+              , T.unpack (unDBName tname)
+              , " and column: "
+              , T.unpack cname
+              , " but got: "
+              , show xs
+              ]
 
-getColumn _ _ _ x =
+getColumn _ _ _ x  _ =
     return $ Left $ pack $ "Invalid result from INFORMATION_SCHEMA: " ++ show x
 
 -- | Extra column information from MySQL schema
@@ -634,7 +707,7 @@ data ColumnInfo = ColumnInfo
 
 -- | Parse the type of column as returned by MySQL's
 -- @INFORMATION_SCHEMA@ tables.
-parseColumnType :: Monad m => Text -> ColumnInfo -> m (SqlType, Maybe Integer)
+parseColumnType :: Text -> ColumnInfo -> ExceptT String IO (SqlType, Maybe Integer)
 -- Ints
 parseColumnType "tinyint" ci | ciColumnType ci == "tinyint(1)" = return (SqlBool, Nothing)
 parseColumnType "int" ci | ciColumnType ci == "int(11)"        = return (SqlInt32, Nothing)
@@ -666,17 +739,19 @@ parseColumnType _ ci                                           = return (SqlOthe
 
 -- | @getAlters allDefs tblName new old@ finds out what needs to
 -- be changed from @old@ to become @new@.
-getAlters :: [EntityDef]
-          -> DBName
-          -> ([Column], [(DBName, [DBName])])
-          -> ([Column], [(DBName, [DBName])])
-          -> ([AlterColumn'], [AlterTable])
-getAlters allDefs tblName (c1, u1) (c2, u2) =
+getAlters
+    :: [EntityDef]
+    -> EntityDef
+    -> ([Column], [(DBName, [DBName])])
+    -> ([Column], [(DBName, [DBName])])
+    -> ([AlterColumn'], [AlterTable])
+getAlters allDefs edef (c1, u1) (c2, u2) =
     (getAltersC c1 c2, getAltersU u1 u2)
   where
+    tblName = entityDB edef
     getAltersC [] old = concatMap dropColumn old
     getAltersC (new:news) old =
-        let (alters, old') = findAlters tblName allDefs new old
+        let (alters, old') = findAlters edef allDefs new old
          in alters ++ getAltersC news old'
 
     dropColumn col =
@@ -688,7 +763,8 @@ getAlters allDefs tblName (c1, u1) (c2, u2) =
     getAltersU ((name, cols):news) old =
         case lookup name old of
             Nothing ->
-                AddUniqueConstraint name (map findTypeAndMaxLen cols) : getAltersU news old
+                AddUniqueConstraint name (map findTypeAndMaxLen cols)
+                : getAltersU news old
             Just ocols ->
                 let old' = filter (\(x, _) -> x /= name) old
                  in if sort cols == ocols
@@ -697,30 +773,48 @@ getAlters allDefs tblName (c1, u1) (c2, u2) =
                             : AddUniqueConstraint name (map findTypeAndMaxLen cols)
                             : getAltersU news old'
         where
-          findTypeAndMaxLen col = let (col', ty) = findTypeOfColumn allDefs tblName col
-                                      (_, ml) = findMaxLenOfColumn allDefs tblName col
-                                   in (col', ty, ml)
+          findTypeAndMaxLen col =
+              let (col', ty) = findTypeOfColumn allDefs tblName col
+                  (_, ml) = findMaxLenOfColumn allDefs tblName col
+              in
+                  (col', ty, ml)
 
 
 -- | @findAlters newColumn oldColumns@ finds out what needs to be
 -- changed in the columns @oldColumns@ for @newColumn@ to be
 -- supported.
-findAlters :: DBName -> [EntityDef] -> Column -> [Column] -> ([AlterColumn'], [Column])
-findAlters tblName allDefs col@(Column name isNull type_ def _defConstraintName maxLen ref) cols =
+findAlters
+    :: EntityDef
+    -> [EntityDef]
+    -> Column
+    -> [Column]
+    -> ([AlterColumn'], [Column])
+findAlters edef allDefs col@(Column name isNull type_ def _defConstraintName maxLen ref) cols =
     case filter ((name ==) . cName) cols of
-    -- new fkey that didnt exist before
-        [] -> case ref of
-               Nothing -> ([(name, Add' col)],[])
-               Just (tname, _b) -> let cnstr = [addReference allDefs (refName tblName name) tname name]
-                                  in (map ((,) tname) (Add' col : cnstr), cols)
-        Column _ isNull' type_' def' _defConstraintName' maxLen' ref':_ ->
+    -- new fkey that didn't exist before
+        [] ->
+            case ref of
+                Nothing -> ([(name, Add' col)],[])
+                Just (tname, cname) ->
+                    let cnstr = [addReference allDefs cname tname name]
+                    in
+                        (map ((,) tname) (Add' col : cnstr), cols)
+        Column _ isNull' type_' def' _defConstraintName' maxLen' ref' : _ ->
             let -- Foreign key
-                refDrop = case (ref == ref', ref') of
-                            (False, Just (_, cname)) -> [(name, DropReference cname)]
-                            _ -> []
-                refAdd  = case (ref == ref', ref) of
-                            (False, Just (tname, _cname)) -> [(tname, addReference allDefs (refName tblName name) tname name)]
-                            _ -> []
+                refDrop =
+                    case (ref == ref', ref') of
+                        (False, Just (_, cname)) ->
+                            [(name, DropReference cname)]
+                        _ ->
+                            []
+                refAdd  =
+                    case (ref == ref', ref) of
+                        (False, Just (tname, cname))
+                            | tname /= entityDB edef
+                            , cname /= fieldDB (entityId edef)
+                            ->
+                            [(tname, addReference allDefs cname tname name)]
+                        _ -> []
                 -- Type and nullability
                 modType | showSqlType type_ maxLen False `ciEquals` showSqlType type_' maxLen' False && isNull == isNull' = []
                         | otherwise = [(name, Change col)]
@@ -732,7 +826,8 @@ findAlters tblName allDefs col@(Column name isNull type_ def _defConstraintName 
                                          Just s -> if T.toUpper s == "NULL" then []
                                                    else [(name, Default $ T.unpack s)]
             in ( refDrop ++ modType ++ modDef ++ refAdd
-               , filter ((name /=) . cName) cols )
+               , filter ((name /=) . cName) cols
+               )
 
   where
     ciEquals x y = T.toCaseFold (T.pack x) == T.toCaseFold (T.pack y)
@@ -774,9 +869,9 @@ showSqlType SqlInt32   _          _     = "INT(11)"
 showSqlType SqlInt64   _          _     = "BIGINT"
 showSqlType SqlReal    _          _     = "DOUBLE"
 showSqlType (SqlNumeric s prec) _ _     = "NUMERIC(" ++ show s ++ "," ++ show prec ++ ")"
-showSqlType SqlString  Nothing    True  = "TEXT CHARACTER SET utf8"
+showSqlType SqlString  Nothing    True  = "TEXT CHARACTER SET utf8mb4"
 showSqlType SqlString  Nothing    False = "TEXT"
-showSqlType SqlString  (Just i)   True  = "VARCHAR(" ++ show i ++ ") CHARACTER SET utf8"
+showSqlType SqlString  (Just i)   True  = "VARCHAR(" ++ show i ++ ") CHARACTER SET utf8mb4"
 showSqlType SqlString  (Just i)   False = "VARCHAR(" ++ show i ++ ")"
 showSqlType SqlTime    _          _     = "TIME"
 showSqlType (SqlOther t) _        _     = T.unpack t
@@ -890,10 +985,6 @@ showAlter table (_, DropReference cname) = concat
     , escapeDBName cname
     ]
 
-refName :: DBName -> DBName -> DBName
-refName (DBName table) (DBName column) =
-    DBName $ T.concat [table, "_", column, "_fkey"]
-
 ----------------------------------------------------------------------
 
 escape :: DBName -> Text
@@ -980,7 +1071,7 @@ mockMigrate :: MySQL.ConnectInfo
          -> IO (Either [Text] [(Bool, Text)])
 mockMigrate _connectInfo allDefs _getter val = do
     let name = entityDB val
-    let (newcols, udefs, fdefs) = mkColumns allDefs val
+    let (newcols, udefs, fdefs) = mysqlMkColumns allDefs val
     let udspair = map udToPair udefs
     case () of
       -- Nothing found, create everything
@@ -990,28 +1081,13 @@ mockMigrate _connectInfo allDefs _getter val = do
                         AddUniqueConstraint uname $
                         map (findTypeAndMaxLen name) ucols ]
         let foreigns = do
-              Column { cName=cname, cReference=Just (refTblName, _a) } <- newcols
-              return $ AlterColumn name (refTblName, addReference allDefs (refName name cname) refTblName cname)
+              Column { cName=cname, cReference=Just (refTblName, refConstraintName) } <- newcols
+              return $ AlterColumn name (refTblName, addReference allDefs refConstraintName refTblName cname)
 
         let foreignsAlt = map (\fdef -> let (childfields, parentfields) = unzip (map (\((_,b),(_,d)) -> (b,d)) (foreignFields fdef))
                                         in AlterColumn name (foreignRefTableDBName fdef, AddReference (foreignRefTableDBName fdef) (foreignConstraintNameDBName fdef) childfields parentfields)) fdefs
 
         return $ Right $ map showAlterDb $ (addTable newcols val): uniques ++ foreigns ++ foreignsAlt
-    {- FIXME redundant, why is this here? The whole case expression is weird
-      -- No errors and something found, migrate
-      (_, _, ([], old')) -> do
-        let excludeForeignKeys (xs,ys) = (map (\c -> case cReference c of
-                                                    Just (_,fk) -> case find (\f -> fk == foreignConstraintNameDBName f) fdefs of
-                                                                     Just _ -> c { cReference = Nothing }
-                                                                     Nothing -> c
-                                                    Nothing -> c) xs,ys)
-            (acs, ats) = getAlters allDefs name (newcols, udspair) $ excludeForeignKeys $ partitionEithers old'
-            acs' = map (AlterColumn name) acs
-            ats' = map (AlterTable  name) ats
-        return $ Right $ map showAlterDb $ acs' ++ ats'
-      -- Errors
-      (_, _, (errs, _)) -> return $ Left errs
-    -}
 
       where
         findTypeAndMaxLen tblName col = let (col', ty) = findTypeOfColumn allDefs tblName col
@@ -1075,7 +1151,7 @@ insertOnDuplicateKeyUpdate record =
 -- @INSERT ... ON DUPLICATE KEY UPDATE@ functionality, exposed via
 -- 'insertManyOnDuplicateKeyUpdate' in this library.
 --
--- @since 3.0.0
+-- @since 2.8.0
 data HandleUpdateCollision record where
   -- | Copy the field directly from the record.
   CopyField :: EntityField record typ -> HandleUpdateCollision record
@@ -1089,9 +1165,7 @@ data HandleUpdateCollision record where
 -- @since 2.6.2
 type SomeField = HandleUpdateCollision
 
-#if MIN_VERSION_base(4,8,0)
 pattern SomeField :: EntityField record typ -> SomeField record
-#endif
 pattern SomeField x = CopyField x
 {-# DEPRECATED SomeField "The type SomeField is deprecated. Use the type HandleUpdateCollision instead, and use the function copyField instead of the data constructor." #-}
 
@@ -1321,3 +1395,6 @@ putManySql' fields ent n = q
         , " ON DUPLICATE KEY UPDATE "
         , Util.commaSeparated updates
         ]
+
+mysqlMkColumns :: [EntityDef] -> EntityDef -> ([Column], [UniqueDef], [ForeignDef])
+mysqlMkColumns allDefs t = mkColumns allDefs t emptyBackendSpecificOverrides
